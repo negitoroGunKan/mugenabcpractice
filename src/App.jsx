@@ -5,7 +5,11 @@ import QuestionDisplay from './components/QuestionDisplay';
 import FastPressButton from './components/FastPressButton';
 import AnswerPanel from './components/AnswerPanel';
 import MultipleChoicePanel from './components/MultipleChoicePanel';
-import { Play, RotateCcw, AlertTriangle, LogIn, LogOut } from 'lucide-react';
+import Play from 'lucide-react/dist/esm/icons/play';
+import RotateCcw from 'lucide-react/dist/esm/icons/rotate-ccw';
+import AlertTriangle from 'lucide-react/dist/esm/icons/alert-triangle';
+import LogIn from 'lucide-react/dist/esm/icons/log-in';
+import LogOut from 'lucide-react/dist/esm/icons/log-out';
 import { parseAnswers } from './utils/quizLogic';
 
 // Firebase 関連
