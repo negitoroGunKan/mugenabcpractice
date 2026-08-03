@@ -142,6 +142,7 @@ const csvUpdatePlugin = () => ({
 
 // https://vite.dev/config/
 export default defineConfig({
+  base: './',
   plugins: [react(), csvUpdatePlugin()],
   server: {
     host: true,
