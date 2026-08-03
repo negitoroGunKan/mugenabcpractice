@@ -10,7 +10,7 @@ import { parseAnswers } from './utils/quizLogic';
 
 // Firebase 関連
 import { auth, googleProvider, db, hasConfig } from './utils/firebase';
-import { signInWithPopup, signOut, onAuthStateChanged } from 'firebase/auth';
+import { signInWithPopup, signInWithRedirect, signOut, onAuthStateChanged } from 'firebase/auth';
 import { doc, getDoc, setDoc, collection, getDocs } from 'firebase/firestore';
 
 const EditIcon = () => (
@@ -350,8 +350,13 @@ function App() {
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (e) {
-      console.error('Login failed:', e);
-      alert('ログインに失敗しました: ' + e.message);
+      console.warn('Popup login failed, trying redirect:', e);
+      try {
+        await signInWithRedirect(auth, googleProvider);
+      } catch (redirectError) {
+        console.error('Redirect login failed:', redirectError);
+        alert('ログインに失敗しました: ' + redirectError.message);
+      }
     }
   };
 
