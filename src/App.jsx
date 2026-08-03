@@ -5,8 +5,13 @@ import QuestionDisplay from './components/QuestionDisplay';
 import FastPressButton from './components/FastPressButton';
 import AnswerPanel from './components/AnswerPanel';
 import MultipleChoicePanel from './components/MultipleChoicePanel';
-import { Play, RotateCcw, AlertTriangle } from 'lucide-react';
+import { Play, RotateCcw, AlertTriangle, LogIn, LogOut } from 'lucide-react';
 import { parseAnswers } from './utils/quizLogic';
+
+// Firebase 関連
+import { auth, googleProvider, db, hasConfig } from './utils/firebase';
+import { signInWithPopup, signOut, onAuthStateChanged } from 'firebase/auth';
+import { doc, getDoc, setDoc, collection, getDocs } from 'firebase/firestore';
 
 const EditIcon = () => (
   <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -59,6 +64,17 @@ function App() {
     }
   });
   const [rankChange, setRankChange] = useState(null); // 'up' | 'down' | null
+  
+  const [user, setUser] = useState(null);
+
+  // Firebase ログイン監視
+  useEffect(() => {
+    if (!hasConfig || !auth) return;
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+    });
+    return () => unsubscribe();
+  }, []);
 
   const [reviewList, setReviewList] = useState({}); // { [questionId]: { rank: number, addedAt: number } }
   const [generalRankList, setGeneralRankList] = useState({}); // { [questionId]: '〇' | '要復習' }
@@ -93,19 +109,27 @@ function App() {
     localStorage.setItem('playUpToOshiji', JSON.stringify(playUpToOshiji));
   }, [playUpToOshiji]);
 
-  const saveReviewList = (newList) => {
+  const saveReviewList = async (newList) => {
     setReviewList(newList);
     try {
       localStorage.setItem('reviewList', JSON.stringify(newList));
+      if (user && db) {
+        const ref = doc(db, 'users', user.uid, 'data', 'reviewList');
+        await setDoc(ref, newList);
+      }
     } catch (e) {
       console.error('Failed to save reviewList', e);
     }
   };
 
-  const saveGeneralRankList = (newList) => {
+  const saveGeneralRankList = async (newList) => {
     setGeneralRankList(newList);
     try {
       localStorage.setItem('generalRankList', JSON.stringify(newList));
+      if (user && db) {
+        const ref = doc(db, 'users', user.uid, 'data', 'generalRankList');
+        await setDoc(ref, newList);
+      }
     } catch (e) {
       console.error('Failed to save generalRankList', e);
     }
@@ -214,9 +238,9 @@ function App() {
         Papa.parse(csvText, {
           header: false,
           skipEmptyLines: true,
-          complete: (results) => {
+          complete: async (results) => {
             // [タグ, 問題種類, 問題, 解答] の4カラム構成
-            const validQuestions = results.data
+            let validQuestions = results.data
               .filter(row => row.length >= 4 && row[2] && row[3])
               .map((row, idx) => {
                 const rawAnswer = row[3].trim();
@@ -267,6 +291,36 @@ function App() {
                   '解説': row[4] ? row[4].trim() : ''
                 };
               });
+
+            // ログイン済みなら Firestore の編集データをマージする
+            if (user && db) {
+              try {
+                const qColRef = collection(db, 'users', user.uid, 'questions');
+                const qSnap = await getDocs(qColRef);
+                const cloudQuestions = {};
+                qSnap.forEach(docSnap => {
+                  cloudQuestions[docSnap.id] = docSnap.data();
+                });
+
+                validQuestions = validQuestions.map(q => {
+                  const cloudQ = cloudQuestions[q['番号']];
+                  if (cloudQ) {
+                    return {
+                      ...q,
+                      '問題': cloudQ.question !== undefined ? cloudQ.question : q['問題'],
+                      '解答': cloudQ.answer !== undefined ? cloudQ.answer : q['解答'],
+                      '解答よみ': cloudQ.reading !== undefined ? cloudQ.reading : q['解答よみ'],
+                      'タグ': cloudQ.tags !== undefined ? cloudQ.tags : q['タグ'],
+                      '押し字': cloudQ.oshiji !== undefined ? cloudQ.oshiji : q['押し字'],
+                      '解説': cloudQ.explanation !== undefined ? cloudQ.explanation : q['解説']
+                    };
+                  }
+                  return q;
+                });
+              } catch (e) {
+                console.error('Failed to merge cloud questions:', e);
+              }
+            }
             
             const tagsSet = new Set();
             validQuestions.forEach(q => {
@@ -291,8 +345,29 @@ function App() {
       });
   };
 
-  // 1. 初回ロード
+  const handleLogin = async () => {
+    if (!auth || !googleProvider) return;
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (e) {
+      console.error('Login failed:', e);
+      alert('ログインに失敗しました: ' + e.message);
+    }
+  };
+
+  const handleLogout = async () => {
+    if (!auth) return;
+    try {
+      await signOut(auth);
+      window.location.reload();
+    } catch (e) {
+      console.error('Logout failed:', e);
+    }
+  };
+
+  // 1. ログイン状態または初回時の CSV をロード・マージ
   useEffect(() => {
+    setAppState('loading');
     loadCsvData((validQuestions) => {
       setAppState('setup');
       setQuestionCount(Math.min(10, validQuestions.length).toString());
@@ -315,7 +390,47 @@ function App() {
     } catch (e) {
       console.error('Failed to load generalRankList', e);
     }
-  }, []);
+  }, [user]);
+
+  // 2. ログイン時にクラウドデータを同期ロードする
+  useEffect(() => {
+    if (!user || !db) return;
+
+    const fetchUserData = async () => {
+      try {
+        // 1. 復習リスト
+        const reviewRef = doc(db, 'users', user.uid, 'data', 'reviewList');
+        const reviewSnap = await getDoc(reviewRef);
+        if (reviewSnap.exists()) {
+          const cloudReviewList = reviewSnap.data();
+          setReviewList(cloudReviewList);
+          localStorage.setItem('reviewList', JSON.stringify(cloudReviewList));
+        }
+
+        // 2. 一般ランク
+        const generalRef = doc(db, 'users', user.uid, 'data', 'generalRankList');
+        const generalSnap = await getDoc(generalRef);
+        if (generalSnap.exists()) {
+          const cloudGeneralRankList = generalSnap.data();
+          setGeneralRankList(cloudGeneralRankList);
+          localStorage.setItem('generalRankList', JSON.stringify(cloudGeneralRankList));
+        }
+
+        // 3. 正答履歴
+        const historyRef = doc(db, 'users', user.uid, 'data', 'quizHistory');
+        const historySnap = await getDoc(historyRef);
+        if (historySnap.exists()) {
+          const cloudHistory = historySnap.data().history || [];
+          setQuizHistory(cloudHistory);
+          localStorage.setItem('quizHistory', JSON.stringify(cloudHistory));
+        }
+      } catch (e) {
+        console.error('Failed to sync cloud data:', e);
+      }
+    };
+
+    fetchUserData();
+  }, [user]);
 
   const currentQ = questions[currentQuestionIndex];
 
@@ -418,6 +533,10 @@ function App() {
         }
         try {
           localStorage.setItem('quizHistory', JSON.stringify(updated));
+          if (user && db) {
+            const ref = doc(db, 'users', user.uid, 'data', 'quizHistory');
+            setDoc(ref, { history: updated }).catch(e => console.error('Firestore save failed:', e));
+          }
         } catch (e) {
           console.error('Failed to save quizHistory', e);
         }
@@ -647,57 +766,101 @@ function App() {
       csvQuestion = editQuestion.slice(0, editOshiji) + '/' + editQuestion.slice(editOshiji);
     }
 
-     fetch('/api/update-question', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        id: currentQ['番号'],
+    if (user && db) {
+      // ログイン時は Firestore に保存
+      const qDocRef = doc(db, 'users', user.uid, 'questions', currentQ['番号']);
+      setDoc(qDocRef, {
         question: csvQuestion,
         answer: cleanAnswer,
         reading: cleanReading,
         tags: editTagsArray.join(', '),
+        oshiji: editOshiji,
         explanation: editExplanation
       })
-    })
-    .then(response => {
-      return response.json().then(resData => {
-        if (response.ok && resData.success) {
-          const newQ = {
-            ...currentQ,
-            '問題': editQuestion,
-            '解答': cleanAnswer,
-            '解答よみ': cleanReading,
-            'タグ': editTagsArray.join(', '),
-            _parsedTags: [...editTagsArray],
-            '押し字': editOshiji,
-            '解説': editExplanation
-          };
-          
-          const updatedQuestions = [...questions];
-          updatedQuestions[currentQuestionIndex] = newQ;
-          setQuestions(updatedQuestions);
-          
-          // 全問題リスト(allQuestions)も同様に更新して、次のゲームや復習リストに反映させる
-          setAllQuestions(prev => prev.map(q => q['番号'] === currentQ['番号'] ? newQ : q));
-          
-          setSaveMessage('保存しました！');
-          setTimeout(() => {
-            setIsEditing(false);
-            setSaveMessage('');
-          }, 1000);
-        } else {
-          setSaveMessage(`保存に失敗しました: ${resData.error || '不明なエラー'}`);
-        }
+      .then(() => {
+        const newQ = {
+          ...currentQ,
+          '問題': editQuestion,
+          '解答': cleanAnswer,
+          '解答よみ': cleanReading,
+          'タグ': editTagsArray.join(', '),
+          _parsedTags: [...editTagsArray],
+          '押し字': editOshiji,
+          '解説': editExplanation
+        };
+        
+        const updatedQuestions = [...questions];
+        updatedQuestions[currentQuestionIndex] = newQ;
+        setQuestions(updatedQuestions);
+        
+        setAllQuestions(prev => prev.map(q => q['番号'] === currentQ['番号'] ? newQ : q));
+        
+        setSaveMessage('保存しました！(クラウド)');
+        setTimeout(() => {
+          setIsEditing(false);
+          setSaveMessage('');
+        }, 1000);
+      })
+      .catch(err => {
+        setSaveMessage(`保存に失敗しました: ${err.message}`);
+      })
+      .finally(() => {
+        setIsSaving(false);
       });
-    })
-    .catch(err => {
-      setSaveMessage(`保存に失敗しました: ${err.message}`);
-    })
-    .finally(() => {
-      setIsSaving(false);
-    });
+    } else {
+      // 従来通りローカル API を叩く
+      fetch('/api/update-question', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          id: currentQ['番号'],
+          question: csvQuestion,
+          answer: cleanAnswer,
+          reading: cleanReading,
+          tags: editTagsArray.join(', '),
+          explanation: editExplanation
+        })
+      })
+      .then(response => {
+        return response.json().then(resData => {
+          if (response.ok && resData.success) {
+            const newQ = {
+              ...currentQ,
+              '問題': editQuestion,
+              '解答': cleanAnswer,
+              '解答よみ': cleanReading,
+              'タグ': editTagsArray.join(', '),
+              _parsedTags: [...editTagsArray],
+              '押し字': editOshiji,
+              '解説': editExplanation
+            };
+            
+            const updatedQuestions = [...questions];
+            updatedQuestions[currentQuestionIndex] = newQ;
+            setQuestions(updatedQuestions);
+            
+            // 全問題リスト(allQuestions)も同様に更新して、次のゲームや復習リストに反映させる
+            setAllQuestions(prev => prev.map(q => q['番号'] === currentQ['番号'] ? newQ : q));
+            
+            setSaveMessage('保存しました！');
+            setTimeout(() => {
+              setIsEditing(false);
+              setSaveMessage('');
+            }, 1000);
+          } else {
+            setSaveMessage(`保存に失敗しました: ${resData.error || '不明なエラー'}`);
+          }
+        });
+      })
+      .catch(err => {
+        setSaveMessage(`保存に失敗しました: ${err.message}`);
+      })
+      .finally(() => {
+        setIsSaving(false);
+      });
+    }
   };
 
   const startReviewMode = (mode) => {
@@ -807,9 +970,57 @@ function App() {
           </button>
         )}
         {!isPlayingOrAnswering && (
-          <h1 style={{ background: 'linear-gradient(to right, #00f2fe, #4facfe)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', fontSize: '2.5rem' }}>
-            早押しクイズ 練習アプリ
-          </h1>
+          <>
+            <h1 style={{ background: 'linear-gradient(to right, #00f2fe, #4facfe)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', fontSize: '2.5rem' }}>
+              早押しクイズ 練習アプリ
+            </h1>
+            <div style={{ marginTop: '1rem', display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '10px' }}>
+              {!hasConfig ? (
+                <span style={{ fontSize: '0.85rem', color: 'var(--error)', background: 'rgba(239,68,68,0.1)', padding: '4px 12px', borderRadius: '20px', border: '1px solid var(--error)' }}>
+                  ⚠️ Firebase未設定（ローカル保存中）
+                </span>
+              ) : user ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', background: 'rgba(255,255,255,0.05)', padding: '6px 14px', borderRadius: '30px', border: '1px solid var(--glass-border)' }}>
+                  {user.photoURL && (
+                    <img src={user.photoURL} alt="avatar" style={{ width: '24px', height: '24px', borderRadius: '50%' }} />
+                  )}
+                  <span style={{ fontSize: '0.9rem', fontWeight: 'bold' }}>{user.displayName}</span>
+                  <button 
+                    onClick={handleLogout} 
+                    className="btn" 
+                    style={{ 
+                      padding: '4px 10px', 
+                      fontSize: '0.8rem', 
+                      background: 'rgba(239, 68, 68, 0.15)', 
+                      borderColor: 'rgba(239, 68, 68, 0.3)',
+                      color: 'var(--error)',
+                      borderRadius: '20px',
+                      height: 'auto',
+                      transform: 'none',
+                      boxShadow: 'none'
+                    }}
+                  >
+                    <LogOut size={12} /> ログアウト
+                  </button>
+                </div>
+              ) : (
+                <button 
+                  onClick={handleLogin} 
+                  className="btn btn-primary" 
+                  style={{ 
+                    padding: '8px 16px', 
+                    fontSize: '0.9rem', 
+                    borderRadius: '30px',
+                    background: 'linear-gradient(135deg, #4285F4, #34A853)',
+                    border: 'none',
+                    boxShadow: '0 4px 15px rgba(66, 133, 244, 0.3)'
+                  }}
+                >
+                  <LogIn size={16} /> Googleでログイン
+                </button>
+              )}
+            </div>
+          </>
         )}
         <p style={{ color: 'var(--text-muted)', marginTop: '0.5rem' }}>
           {isPlayingOrAnswering && (
